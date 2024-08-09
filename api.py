@@ -14,6 +14,7 @@ import redis
 from redis.exceptions import ConnectionError as RedisConnectionError
 import time
 from PIL import Image, ImageDraw
+from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
 
 from mechanisms.segmentation_pipe import load_model, ground_image, sam_seg_rects
 from sam2.sam2_image_predictor import SAM2ImagePredictor
@@ -26,7 +27,7 @@ sam2_model = None
 grounding_dino_model = None
 sam2_predictor = None
 camera_stream = None
-
+sam2_mask_generator = None
 # Redis configuration
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
@@ -57,14 +58,14 @@ class CameraConfig(BaseModel):
 
 @app.on_event("startup")
 async def startup_event():
-    global sam2_model, grounding_dino_model, sam2_predictor
+    global sam2_model, grounding_dino_model, sam2_predictor, sam2_mask_generator
 
     # Load SAM2 model
     sam2_checkpoint = "checkpoints/sam2_hiera_large.pt"
     model_cfg = "sam2_hiera_l.yaml"
     sam2_model = build_sam2(model_cfg, sam2_checkpoint, device="cuda")
     sam2_predictor = SAM2ImagePredictor(sam2_model)
-
+    sam2_mask_generator = SAM2AutomaticMaskGenerator(sam2_model)
     # Load GroundingDINO model
     config_file = "./gd_configs/grounding_dino_config.py"
     checkpoint_path = "./checkpoints/groundingdino_swint_ogc.pth"
@@ -184,7 +185,8 @@ def process_frame(frame, config):
     cropped_masks = [crop_to_polygon(mask, config.polygon) for mask in all_masks]
 
     # Process object masks
-    object_masks = generate_object_masks(image)
+    cropped = image.crop(config.polygon)
+    object_masks = sam2_mask_generator.generate(np.array(cropped.convert("RGB")))
     non_overlapping_masks = process_multiple_masks(cropped_masks, object_masks)
 
     # Create final masked image
@@ -276,16 +278,6 @@ def get_bounding_box(mask):
     top, left = np.min(non_zero, axis=1)
     bottom, right = np.max(non_zero, axis=1)
     return (int(left), int(top), int(right), int(bottom))
-
-
-def generate_object_masks(image):
-    # This is a placeholder function. In a real-world scenario, you would use
-    # an object detection model to generate masks for all objects in the image.
-    # For this example, we'll create a dummy mask.
-    dummy_mask = np.zeros((image.height, image.width), dtype=bool)
-    dummy_mask[50:150, 50:150] = True  # Create a small square mask
-    return [{"segmentation": dummy_mask}]
-
 
 if __name__ == "__main__":
     import uvicorn
