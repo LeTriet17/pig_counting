@@ -50,7 +50,7 @@ class SegmentationConfig(BaseModel):
 
 
 class CameraConfig(BaseModel):
-    camera_id: int = 0
+    camera_source: str
     width: int = 640
     height: int = 480
     fps: int = 30
@@ -59,7 +59,6 @@ class CameraConfig(BaseModel):
 @app.on_event("startup")
 async def startup_event():
     global sam2_model, grounding_dino_model, sam2_predictor, sam2_mask_generator
-
     # Load SAM2 model
     sam2_checkpoint = "checkpoints/sam2_hiera_large.pt"
     model_cfg = "sam2_hiera_l.yaml"
@@ -75,6 +74,12 @@ async def startup_event():
     if torch.cuda.get_device_properties(0).major >= 8:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+        
+    # Start the camera reading thread
+    threading.Thread(target=camera_reader, daemon=True).start()
+    
+    # Start the frame processing thread
+    threading.Thread(target=frame_processor, daemon=True).start()
 
 
 @app.post("/set_camera")
@@ -82,7 +87,7 @@ async def set_camera(config: CameraConfig):
     global camera_stream
     if camera_stream is not None:
         camera_stream.release()
-    camera_stream = cv2.VideoCapture(config.camera_id)
+    camera_stream = cv2.VideoCapture(config.camera_source)
     camera_stream.set(cv2.CAP_PROP_FRAME_WIDTH, config.width)
     camera_stream.set(cv2.CAP_PROP_FRAME_HEIGHT, config.height)
     camera_stream.set(cv2.CAP_PROP_FPS, config.fps)
@@ -92,6 +97,7 @@ async def set_camera(config: CameraConfig):
 def camera_reader():
     global camera_stream
     while True:
+        
         if camera_stream is not None and camera_stream.isOpened():
             ret, frame = camera_stream.read()
             if ret:
@@ -119,7 +125,6 @@ def frame_processor():
             if data:
                 _, item = data
                 frame_data, config_data = json.loads(item)
-
                 # Decode frame
                 frame = cv2.imdecode(
                     np.frombuffer(base64.b64decode(frame_data), np.uint8),
@@ -129,7 +134,6 @@ def frame_processor():
                 # Process frame
                 config = SegmentationConfig(**json.loads(config_data))
                 result = process_frame(frame, config)
-
                 # Push result to result queue
                 redis_client.lpush(RESULT_QUEUE, json.dumps(result))
                 redis_client.ltrim(
@@ -160,6 +164,7 @@ async def websocket_endpoint(websocket: WebSocket):
             result_data = redis_client.rpop(RESULT_QUEUE)
             if result_data:
                 result = json.loads(result_data)
+                print(result)
                 await websocket.send_json(result)
             else:
                 await asyncio.sleep(0.01)
@@ -182,27 +187,14 @@ def process_frame(frame, config):
     all_masks = sam_seg_rects(sam2_predictor, None, None, image, pred_dict["boxes"])
 
     # Crop masks to polygon
-    cropped_masks = [crop_to_polygon(mask, config.polygon) for mask in all_masks]
+    cropped_masks = [crop_mask_to_polygon(mask, config.polygon) for mask in all_masks]
 
     # Process object masks
-    cropped = image.crop(config.polygon)
+    cropped = crop_image_to_polygon(image, config.polygon)
     object_masks = sam2_mask_generator.generate(np.array(cropped.convert("RGB")))
     non_overlapping_masks = process_multiple_masks(cropped_masks, object_masks)
 
-    # Create final masked image
-    final_mask = create_final_mask(non_overlapping_masks)
-    masked_image = apply_mask_to_image(image, final_mask)
-
-    # Convert masked image to base64
-    _, buffer = cv2.imencode(
-        ".jpg", cv2.cvtColor(np.array(masked_image), cv2.COLOR_RGB2BGR)
-    )
-    masked_image_base64 = base64.b64encode(buffer).decode("utf-8")
-
-    # Get bounding box
-    bounding_box = get_bounding_box(final_mask)
-
-    return {"masked_image": masked_image_base64, "bounding_box": bounding_box}
+    return {"num_pigs": len(cropped_masks), "num_objects": len(non_overlapping_masks)}
 
 
 def box_segment(image, text_prompt, box_threshold, text_threshold):
@@ -212,30 +204,66 @@ def box_segment(image, text_prompt, box_threshold, text_threshold):
         )
     return image_with_box, pred_dict
 
-
-def crop_to_polygon(mask, poly):
-    # Create a polygon mask
-    poly_mask = Image.new("L", mask.shape[-2:], 0)
-    ImageDraw.Draw(poly_mask).polygon(poly, outline=1, fill=1)
-    poly_mask = np.array(poly_mask)
-
+def crop_mask_to_polygon(input_mask, poly):
+    
+    # Remove the singleton dimension
+    mask = input_mask[0]
+    
+    # Create a new mask for the polygon
+    polygon_mask = Image.new('L', (mask.shape[1], mask.shape[0]), 0)
+    ImageDraw.Draw(polygon_mask).polygon(poly, outline=1, fill=255)
+    polygon_mask = np.array(polygon_mask)
+    
     # Apply the polygon mask
-    cropped_mask = mask * poly_mask
+    masked = mask * (polygon_mask > 0)
+    
+    # Find the bounding box of the polygon
+    y_coords, x_coords = np.where(polygon_mask > 0)
+    top = y_coords.min()
+    bottom = y_coords.max()
+    left = x_coords.min()
+    right = x_coords.max()
+    
+    # Crop the masked image to the bounding box
+    cropped = masked[top:bottom+1, left:right+1]
+    
+    return cropped
 
-    # Get the bounding box of the polygon
-    non_zero = np.nonzero(poly_mask)
-    top, left = np.min(non_zero, axis=1)
-    bottom, right = np.max(non_zero, axis=1)
+def crop_image_to_polygon(image, polygon):
+    """
+    Crops the given PIL image to the specified polygon area.
 
-    # Crop the mask
-    cropped_mask = cropped_mask[top : bottom + 1, left : right + 1]
+    :param image: A PIL Image object.
+    :param polygon: List of (x, y) tuples representing the vertices of the polygon.
+    :return: A new PIL Image object cropped to the polygon area.
+    """
+    # Create a mask the same size as the image, filled with black (0)
+    if type(image) == np.ndarray:
+        image = np.uint8(np.squeeze(image))
+        h, w = image.shape[:2]
+        image = Image.fromarray(image)
+    mask = Image.new("L", image.size, 0)
 
-    return cropped_mask, (left, top, right, bottom)
+    # Create a draw object
+    draw = ImageDraw.Draw(mask)
+
+    # Draw the polygon on the mask with white (255)
+    draw.polygon(polygon, outline=255, fill=255)
+
+    # Apply the mask to the image
+    result = Image.new("RGB", image.size)
+    result.paste(image, mask=mask)
+
+    # Crop the image to the bounding box of the polygon
+    bbox = mask.getbbox()
+    cropped_image = result.crop(bbox)
+
+    return cropped_image
 
 
 def process_multiple_masks(all_cropped_masks, object_masks, threshold=0.95):
     non_overlapping_masks = object_masks.copy()
-    for pig_mask, _ in all_cropped_masks:
+    for pig_mask in all_cropped_masks:
         for idx, obj_mask in enumerate(non_overlapping_masks):
             if check_mask_overlap(pig_mask, obj_mask["segmentation"], threshold):
                 del non_overlapping_masks[idx]
@@ -260,24 +288,6 @@ def create_final_mask(non_overlapping_masks):
         final_mask = np.logical_or(final_mask, mask["segmentation"])
     return final_mask
 
-
-def apply_mask_to_image(image, mask):
-    if mask is None:
-        return image
-    masked_image = np.array(image)
-    masked_image[~mask] = [0, 0, 0]  # Set background to black
-    return Image.fromarray(masked_image)
-
-
-def get_bounding_box(mask):
-    if mask is None:
-        return None
-    non_zero = np.nonzero(mask)
-    if len(non_zero[0]) == 0:
-        return None
-    top, left = np.min(non_zero, axis=1)
-    bottom, right = np.max(non_zero, axis=1)
-    return (int(left), int(top), int(right), int(bottom))
 
 if __name__ == "__main__":
     import uvicorn
