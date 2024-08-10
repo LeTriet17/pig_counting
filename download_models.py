@@ -25,7 +25,7 @@ def main():
     os.makedirs('checkpoints', exist_ok=True)
     os.chdir('checkpoints')
 
-    download_file(sam2_hiera_l_url, os.path.basename(sam2_hiera_l_url))
+    download_file(sam2_hiera_s_url, os.path.basename(sam2_hiera_s_url))
     download_file(groundingdino_url, os.path.basename(groundingdino_url))
 
     os.chdir('..')

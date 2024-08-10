@@ -135,13 +135,24 @@ def load_image(image_path):
     image_pil = Image.open(image_path).convert("RGB")
     return prepare_image(image_pil)
 
-def load_model(model_config_path, model_checkpoint_path, cpu_only=False):
+def load_model(model_config_path, model_checkpoint_path, cpu_only=False, use_fp16=False):
     args = SLConfig.fromfile(model_config_path)
     args.device = "cuda" if not cpu_only else "cpu"
     model = build_model(args)
+    
     checkpoint = torch.load(model_checkpoint_path, map_location="cpu")
+    
+    if use_fp16:
+        model.half()  # Convert the model to FP16
+        for key in checkpoint["model"]:
+            checkpoint["model"][key] = checkpoint["model"][key].half()
+    
     load_res = model.load_state_dict(clean_state_dict(checkpoint["model"]), strict=False)
     model.eval()
+    
+    if use_fp16:
+        model = model.to(torch.float16)
+    
     return model
 
 def get_grounding_output(model, image, caption, box_threshold, text_threshold=None, with_logits=True, cpu_only=False, token_spans=None):
@@ -151,12 +162,13 @@ def get_grounding_output(model, image, caption, box_threshold, text_threshold=No
     if not caption.endswith("."):
         caption = caption + "."
     device = "cuda" if not cpu_only else "cpu"
-    model = model.to(device)
-    image = image.to(device)
-    with torch.no_grad():
-        outputs = model(image[None], captions=[caption])
-    logits = outputs["pred_logits"].sigmoid()[0]  # (nq, 256)
-    boxes = outputs["pred_boxes"][0]  # (nq, 4)
+    with torch.autocast(device_type="cuda"):
+        model = model.to(device)
+        image = image.to(device)
+        with torch.no_grad():
+            outputs = model(image[None], captions=[caption])
+        logits = outputs["pred_logits"].sigmoid()[0]  # (nq, 256)
+        boxes = outputs["pred_boxes"][0]  # (nq, 4)
 
     # filter output
     if token_spans is None:
@@ -207,21 +219,6 @@ def get_grounding_output(model, image, caption, box_threshold, text_threshold=No
 
 
     return boxes_filt, pred_phrases
-
-
-def load_sam_model(model_path):
-    torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
-
-    if torch.cuda.get_device_properties(0).major >= 8:
-        # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        
-    sam2_checkpoint = "checkpoints/sam2_hiera_large.pt"
-    model_cfg = "sam2_hiera_l.yaml"
-    sam2_model = build_sam2(model_cfg, sam2_checkpoint, device="cuda")
-    predictor = SAM2ImagePredictor(sam2_model)
-    return predictor
 
 def set_prediction_target(model, image):
     image = np.array(image)

@@ -33,7 +33,7 @@ def build_sam2(
     cfg = compose(config_name=config_file, overrides=hydra_overrides_extra)
     OmegaConf.resolve(cfg)
     model = instantiate(cfg.model, _recursive_=True)
-    _load_checkpoint(model, ckpt_path)
+    _load_checkpoint(model, ckpt_path, use_fp16=False)
     model = model.to(device)
     if mode == "eval":
         model.eval()
@@ -76,14 +76,27 @@ def build_sam2_video_predictor(
     return model
 
 
-def _load_checkpoint(model, ckpt_path):
+def _load_checkpoint(model, ckpt_path, use_fp16=False):
     if ckpt_path is not None:
+        print(f"Loading checkpoint from {ckpt_path}")
         sd = torch.load(ckpt_path, map_location="cpu")["model"]
-        missing_keys, unexpected_keys = model.load_state_dict(sd)
+        
+        if use_fp16:
+            model.half()  # Convert the model to FP16
+            for key in sd:
+                sd[key] = sd[key].half()
+        
+        missing_keys, unexpected_keys = model.load_state_dict(sd, strict=False)
         if missing_keys:
-            logging.error(missing_keys)
-            raise RuntimeError()
+            logging.error(f"Missing keys: {missing_keys}")
+            raise RuntimeError("Missing keys in checkpoint")
         if unexpected_keys:
-            logging.error(unexpected_keys)
-            raise RuntimeError()
-        logging.info("Loaded checkpoint sucessfully")
+            logging.error(f"Unexpected keys: {unexpected_keys}")
+            raise RuntimeError("Unexpected keys in checkpoint")
+        
+        logging.info("Loaded checkpoint successfully")
+        
+        if use_fp16:
+            model = model.to(torch.float16)
+    
+    return model

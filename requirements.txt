@@ -9,3 +9,5 @@ opencv-python
 supervision>=0.22.0
 pycocotools
 hydra-core
+redis
+fastapi[standard]
