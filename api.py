@@ -9,19 +9,16 @@ from typing import List, Tuple, Optional
 import asyncio
 import base64
 import json
-import threading
+from groundingdino.gdino.model import OnnxGDINO
+from  groundingdino.utils.gdino_utils import load_image, viz
 import aioredis
 from aioredis.exceptions import ConnectionError as RedisConnectionError
 import time
 from PIL import Image, ImageDraw
-from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
 from fastapi.responses import StreamingResponse
 import time
-from mechanisms.segmentation_pipe import load_model, ground_image, sam_seg_rects
-from sam2.sam2_image_predictor import SAM2ImagePredictor
-from sam2.build_sam import build_sam2
-
 app = FastAPI()
+import onnxruntime
 
 # Configuration
 class Config:
@@ -36,11 +33,9 @@ class Config:
 redis_config = Config()
 
 # Global variables
-sam2_model = None
+sam_model = None
 grounding_dino_model = None
-sam2_predictor = None
 camera_stream = None
-sam2_mask_generator = None
 redis_client = None
 
 class SegmentationConfig(BaseModel):
@@ -54,10 +49,17 @@ class CameraConfig(BaseModel):
     width: int = 640
     height: int = 480
     fps: int = 30
+def load_sam_model():
+    global sam_model
+    sam_model=onnxruntime.InferenceSession('/models/FastSam/fast_sam_1024.onnx', providers=['CUDAExecutionProvider'])
 
+def load_grounding_dino_model():
+    global grounding_dino_model
+    grounding_dino_model = OnnxGDINO(type='gdino_fp32', trt=True)
+    
 @app.on_event("startup")
 async def startup_event():
-    global sam2_model, grounding_dino_model, sam2_predictor, sam2_mask_generator, redis_client, redis_config
+    global sam_model, grounding_dino_model, redis_client, redis_config
     
     # Initialize Redis client
     try:
@@ -67,9 +69,7 @@ async def startup_event():
         redis_client = None
     
     # Load models
-    sam2_model = load_sam2_model()
-    sam2_predictor = SAM2ImagePredictor(sam2_model)
-    sam2_mask_generator = SAM2AutomaticMaskGenerator(sam2_model)
+    sam_model = load_sam_model()
     grounding_dino_model = load_grounding_dino_model()
 
     # Enable TF32 for Ampere GPUs
@@ -85,16 +85,6 @@ async def startup_event():
 async def shutdown_event():
     if redis_client is not None:
         redis_client.close()
-
-def load_sam2_model():
-    sam2_checkpoint = "checkpoints/sam2_hiera_small.pt"
-    model_cfg = "sam2_hiera_s.yaml"
-    return build_sam2(model_cfg, sam2_checkpoint, device="cuda")    
-
-def load_grounding_dino_model():
-    config_file = "./gd_configs/grounding_dino_config.py"
-    checkpoint_path = "./checkpoints/groundingdino_swint_ogc.pth"
-    return load_model(config_file, checkpoint_path, use_fp16=False).eval().to("cuda")
 
 @app.post("/set_camera")
 async def set_camera(config: CameraConfig):
@@ -202,13 +192,13 @@ def process_frame(frame, config):
     image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     now = time.time()
     # Perform box segmentation
-    image_with_box, pred_dict = box_segment(image, config.text_prompt, config.box_threshold, config.text_threshold)
+    filtered_boxes, predicted_phrases = box_segment(image, config.text_prompt, config.box_threshold, config.text_threshold)
     print(f"Box segmentation completed in {time.time() - now:.2f} seconds")
     # Generate masks for pigs
-    all_masks = sam_seg_rects(sam2_predictor, None, None, image, pred_dict["boxes"])
+    pig_masks = sam_seg_rects(sam2_predictor, None, None, image, pred_dict["boxes"])
     
     # Crop masks to the specified polygon
-    cropped_masks = [crop_mask_to_polygon(mask, config.polygon) for mask in all_masks]
+    cropped_masks = [crop_mask_to_polygon(mask, config.polygon) for mask in pig_masks]
     
     # Crop the image to the specified polygon
     cropped = crop_image_to_polygon(image, config.polygon)
@@ -224,7 +214,7 @@ def process_frame(frame, config):
     
     # Prepare the output
     output = {
-        "num_pigs": len(all_masks),
+        "num_pigs": len(pig_masks),
         "num_objects": len(non_overlapping_masks),
         "original_frame": encode_frame(frame),
         # "pig_masks": cropped_masks,
@@ -305,11 +295,17 @@ async def generate_visualization_stream():
             await asyncio.sleep(0.01)
             
 def box_segment(image, text_prompt, box_threshold, text_threshold):
-    with torch.no_grad():
-        image_with_box, size, boxes_filt, pred_phrases, pred_dict = ground_image(
-            grounding_dino_model, text_prompt, image, box_threshold, text_threshold
-        )
-    return image_with_box, pred_dict
+    global grounding_dino_model
+    payload = grounding_dino_model.preprocess_query(text_prompt)
+    img, img_transformed = load_image(image)
+
+    filtered_boxes, predicted_phrases = grounding_dino_model.inference(img_transformed.astype(np.float32), 
+                                                    payload,
+                                                    text_threshold=text_threshold, 
+                                                    box_threshold=box_threshold,)
+
+    return filtered_boxes, predicted_phrases
+
 
 def crop_mask_to_polygon(input_mask, poly):
     
