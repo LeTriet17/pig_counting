@@ -1,0 +1,16 @@
+*.DS_Store*
+.vscode
+
+__pycache__/
+
+.dev/
+.exp/
+.slurm/
+
+assets/checkpoints/
+assets/export_models/
+coco/
+
+demo/gazesam/models/pytorch
+demo/gazesam/models/onnx
+demo/gazesam/models/tensorrt
